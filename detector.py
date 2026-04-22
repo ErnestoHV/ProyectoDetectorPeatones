@@ -10,6 +10,8 @@ from ultralytics import YOLO
 from collections import defaultdict
 import os
 import sys
+import ctypes
+from datetime import datetime
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN GENERAL
@@ -109,14 +111,57 @@ def hud(frame, n_personas: int, fps_real: float) -> np.ndarray:
     return frame
 
 
+def nombre_salida_con_timestamp(base: str, extension: str = ".mp4") -> str:
+    """Devuelve un nombre de archivo con fecha/hora agregado.
+
+    Se usa un formato válido en Windows evitando dos puntos en el nombre.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")
+    return f"{base}_{timestamp}{extension}"
+
+
+def calcular_dimensiones_display(ancho_video: int, alto_video: int,
+                                  margen: float = 0.95) -> tuple:
+    """
+    Calcula las dimensiones de display manteniendo la relación de aspecto.
+    Usa ctypes.windll directamente: sin tkinter, sin ventanas extra.
+    Retorna (nuevo_ancho, nuevo_alto).
+    """
+    try:
+        # GetSystemMetrics(0) = ancho de pantalla, (1) = alto de pantalla.
+        # No se llama a SetProcessDpiAwareness para no interferir con OpenCV.
+        user32         = ctypes.windll.user32
+        ancho_pantalla = user32.GetSystemMetrics(0)
+        alto_pantalla  = user32.GetSystemMetrics(1)
+    except Exception:
+        ancho_pantalla, alto_pantalla = 1920, 1080
+
+    max_ancho = int(ancho_pantalla * margen)
+    max_alto  = int(alto_pantalla  * margen)
+    escala    = min(max_ancho / ancho_video, max_alto / alto_video, 1.0)
+
+    nuevo_ancho = int(ancho_video * escala)
+    nuevo_alto  = int(alto_video  * escala)
+
+    print(f"[INFO] Pantalla detectada: {ancho_pantalla}x{alto_pantalla}")
+    print(f"[INFO] Video original:     {ancho_video}x{alto_video}")
+    print(f"[INFO] Ventana de display: {nuevo_ancho}x{nuevo_alto}")
+
+    return nuevo_ancho, nuevo_alto
+
+
 # ─────────────────────────────────────────────
 # BUCLE PRINCIPAL
 # ─────────────────────────────────────────────
 
-def ejecutar(fuente, guardar: bool = False, ruta_salida: str = "resultado.mp4"):
+def ejecutar(fuente, guardar: bool = False, ruta_salida: str = None,
+             ajustar_pantalla: bool = False):
     """
-    fuente  : 0 para webcam, o ruta a un archivo de video (str)
-    guardar : True para guardar el video procesado
+    fuente           : 0 para webcam, o ruta a un archivo de video (str)
+    guardar          : True para guardar el video procesado
+    ruta_salida      : nombre final del archivo de salida
+    ajustar_pantalla : True para escalar la ventana al tamaño de la pantalla
+                       manteniendo la relación de aspecto (solo modo video)
     """
     # Verificar que el modelo existe
     if not os.path.exists(RUTA_MODELO):
@@ -138,9 +183,23 @@ def ejecutar(fuente, guardar: bool = False, ruta_salida: str = "resultado.mp4"):
     alto   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 30
 
-    # Escritor de video (opcional)
+    # ── Calcular dimensiones de display ──────────────────────────────────────
+    # Se calcula ANTES del bucle para no hacerlo cada frame.
+    # No se llama a namedWindow aquí: cv2.imshow crea la ventana sola con el
+    # tamaño exacto del frame que recibe, evitando la ventana gris fantasma.
+    nombre_ventana = "Detector de Personas - Trayectoria  [Q para salir]"
+
+    if ajustar_pantalla:
+        disp_w, disp_h = calcular_dimensiones_display(ancho, alto)
+    else:
+        disp_w, disp_h = ancho, alto
+
+    # ── Escritor de video (opcional) ─────────────────────────────────────────
+    # El video guardado siempre usa la resolución original del video fuente.
     writer = None
     if guardar:
+        if not ruta_salida:
+            ruta_salida = nombre_salida_con_timestamp("resultado")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(ruta_salida, fourcc, fps_in, (ancho, alto))
         print(f"[INFO] Guardando resultado en: {ruta_salida}")
@@ -156,6 +215,8 @@ def ejecutar(fuente, guardar: bool = False, ruta_salida: str = "resultado.mp4"):
         if not ok:
             print("[INFO] Fin del video o no se pudo leer el frame.")
             break
+
+        # frame = cv2.flip(frame, 1)
 
         # ── Inferencia + tracking ─────────────────
         resultados = modelo.track(
@@ -186,11 +247,21 @@ def ejecutar(fuente, guardar: bool = False, ruta_salida: str = "resultado.mp4"):
 
         frame = hud(frame, n_activas, fps_display)
 
-        # ── Mostrar ───────────────────────────────
-        cv2.imshow("Detector de Personas — Trayectoria  [Q para salir]", frame)
-
+        # ── Guardar (resolución original) ─────────
         if writer:
             writer.write(frame)
+
+        # ── Mostrar ───────────────────────────────
+        # Si se activa ajustar_pantalla, el frame se redimensiona ANTES de
+        # pasarlo a imshow. De este modo imshow crea una sola ventana del
+        # tamaño exacto del frame, sin necesidad de namedWindow previo.
+        if ajustar_pantalla and (disp_w != ancho or disp_h != alto):
+            frame_display = cv2.resize(frame, (disp_w, disp_h),
+                                       interpolation=cv2.INTER_LINEAR)
+        else:
+            frame_display = frame
+
+        cv2.imshow(nombre_ventana, frame_display)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             print("[INFO] Salida solicitada por el usuario.")
@@ -221,8 +292,8 @@ def menu():
     if opcion == "1":
         # ── Modo cámara ──────────────────────────
         guardar = input("\n¿Guardar el video resultante? (s/n): ").strip().lower() == "s"
-        salida  = "resultado_camara.mp4" if guardar else ""
-        ejecutar(fuente=0, guardar=guardar, ruta_salida=salida)
+        salida  = nombre_salida_con_timestamp("resultado_camara") if guardar else None
+        ejecutar(fuente=0, guardar=guardar, ruta_salida=salida, ajustar_pantalla=True)
 
     elif opcion == "2":
         # ── Modo video ───────────────────────────
@@ -236,8 +307,8 @@ def menu():
 
         guardar = input("¿Guardar el video resultante? (s/n): ").strip().lower() == "s"
         nombre  = os.path.splitext(os.path.basename(ruta))[0]
-        salida  = f"resultado_{nombre}.mp4" if guardar else ""
-        ejecutar(fuente=ruta, guardar=guardar, ruta_salida=salida)
+        salida  = nombre_salida_con_timestamp(f"resultado_{nombre}") if guardar else None
+        ejecutar(fuente=ruta, guardar=guardar, ruta_salida=salida, ajustar_pantalla=True)
 
     else:
         print("[ERROR] Opción no válida. Vuelve a ejecutar el script.")
